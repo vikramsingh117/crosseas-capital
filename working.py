@@ -42,23 +42,24 @@ def create_features(df):
     df['MONEYNESS'] = np.nan
 
     df.loc[df['IS_CALL'] == 1, 'MONEYNESS'] = underlying_price / df['STRIKE']
-
     df.loc[df['IS_CALL'] == 0, 'MONEYNESS'] = underlying_price / df['STRIKE']
     
     df['VOLUME_RATIO'] = df['VOLUME'] / (df['VOLUME'].rolling(window=10, min_periods=1).mean() + 1)
     
     return df
 
-def create_target(df):
+def create_target_and_triggers(df, price_change_threshold=0.02):
     df = df.sort_values(['DATE', 'STRIKE', 'OP_TYPE'])
     
     df['NEXT_LTP'] = df.groupby(['STRIKE', 'OP_TYPE'])['LTP'].shift(-1)
     
     df['RETURN'] = (df['NEXT_LTP'] - df['LTP']) / df['LTP']
     
-    df['TARGET'] = (df['RETURN'] > 0).astype(int)
-    
-    df = df.dropna(subset=['NEXT_LTP', 'RETURN'])
+    df['TARGET'] = 0
+    df.loc[df['RETURN'] > price_change_threshold, 'TARGET'] = 1
+    df.loc[df['RETURN'] < -price_change_threshold, 'TARGET'] = -1
+
+    df = df.dropna(subset=['NEXT_LTP', 'RETURN', 'TARGET'])
     
     return df
 
@@ -82,10 +83,11 @@ def train_model(df):
     )
     
     model = RandomForestClassifier(
-        n_estimators=50,
+        n_estimators=100,
         max_depth=10,
         random_state=42,
-        n_jobs=-1
+        n_jobs=-1,
+        class_weight='balanced'
     )
     
     print("Training model...")
@@ -110,74 +112,133 @@ def train_model(df):
     
     return model, X_test, y_test, y_pred
 
-def analyze_option_types(df):
-    print("\n=== Analyzing Option Price Movements by Moneyness ===")
+def simulate_trades(df, model, X_test, y_test, holding_period_days=2, stop_loss_pct=0.05, take_profit_pct=0.10):
+    print("\n=== Simulating Trades ===")
     
-    atm_lower = 0.99
-    atm_upper = 1.01
+    test_df = X_test.copy()
+    test_df['TRUE_TARGET'] = y_test
+    
+    test_indices = X_test.index
+    sim_df = df.loc[test_indices].copy()
+    
+    sim_df['PREDICTED_TARGET'] = model.predict(X_test)
 
-    otm_calls = df[(df['IS_CALL'] == 1) & (df['MONEYNESS'] < atm_lower)]
-    print(f"\n--- 1% OTM CALLS (Underlying / STRIKE < {atm_lower}) ---")
-    if not otm_calls.empty:
-        print(f"Number of 1% OTM Calls: {len(otm_calls)}")
-        print(f"Percentage of price increases (TARGET=1): {otm_calls['TARGET'].mean():.2%}")
-    else:
-        print("No 1% OTM Call options found for analysis with current thresholds.")
+    trades = []
+    
+    sim_df = sim_df.sort_values(by=['DATE', 'STRIKE', 'OP_TYPE'])
 
-    otm_puts = df[(df['IS_CALL'] == 0) & (df['MONEYNESS'] > atm_upper)]
-    print(f"\n--- 1% OTM PUTS (Underlying / STRIKE > {atm_upper}) ---")
-    if not otm_puts.empty:
-        print(f"Number of 1% OTM Puts: {len(otm_puts)}")
-        print(f"Percentage of price increases (TARGET=1): {otm_puts['TARGET'].mean():.2%}")
-    else:
-        print("No 1% OTM Put options found for analysis with current thresholds.")
+    for index, row in sim_df.iterrows():
+        prediction = row['PREDICTED_TARGET']
+        current_ltp = row['LTP']
+        true_return = row['RETURN']
         
-    atm_calls = df[(df['IS_CALL'] == 1) & (df['MONEYNESS'] >= atm_lower) & (df['MONEYNESS'] <= atm_upper)]
-    print(f"\n--- 0.0% ATM CALLS ({atm_lower} <= Underlying / STRIKE <= {atm_upper}) ---")
-    if not atm_calls.empty:
-        print(f"Number of 0.0% ATM Calls: {len(atm_calls)}")
-        print(f"Percentage of price increases (TARGET=1): {atm_calls['TARGET'].mean():.2%}")
+        signal = None
+        if prediction == 1:
+            signal = 'LONG'
+        elif prediction == -1:
+            signal = 'SHORT' 
+        
+        if signal:
+            trade_entry_price = current_ltp
+            sl_price_long = trade_entry_price * (1 - stop_loss_pct)
+            tp_price_long = trade_entry_price * (1 + take_profit_pct)
+            
+            sl_price_short = trade_entry_price * (1 + stop_loss_pct)
+            tp_price_short = trade_entry_price * (1 - take_profit_pct)
+
+            trade_exit_price = None
+            trade_profit_loss = 0
+            exit_reason = "Holding Period Expiry"
+            
+            actual_exit_price = trade_entry_price * (1 + true_return)
+
+            if signal == 'LONG':
+                if actual_exit_price <= sl_price_long:
+                    trade_profit_loss = (sl_price_long - trade_entry_price) / trade_entry_price
+                    exit_reason = "Stop Loss Hit"
+                    trade_exit_price = sl_price_long
+                elif actual_exit_price >= tp_price_long:
+                    trade_profit_loss = (tp_price_long - trade_entry_price) / trade_entry_price
+                    exit_reason = "Take Profit Hit"
+                    trade_exit_price = tp_price_long
+                else:
+                    trade_profit_loss = true_return
+                    trade_exit_price = actual_exit_price
+                    
+            elif signal == 'SHORT':
+                if actual_exit_price >= sl_price_short:
+                    trade_profit_loss = (trade_entry_price - sl_price_short) / trade_entry_price
+                    exit_reason = "Stop Loss Hit"
+                    trade_exit_price = sl_price_short
+                elif actual_exit_price <= tp_price_short:
+                    trade_profit_loss = (trade_entry_price - tp_price_short) / trade_entry_price
+                    exit_reason = "Take Profit Hit"
+                    trade_exit_price = tp_price_short
+                else:
+                    trade_profit_loss = -true_return
+                    trade_exit_price = actual_exit_price
+
+            trades.append({
+                'DATE': row['DATE'],
+                'STRIKE': row['STRIKE'],
+                'OP_TYPE': row['OP_TYPE'],
+                'SIGNAL': signal,
+                'ENTRY_LTP': trade_entry_price,
+                'EXIT_LTP': trade_exit_price,
+                'PREDICTED_TARGET': prediction,
+                'TRUE_RETURN': true_return,
+                'PROFIT_LOSS_PCT': trade_profit_loss,
+                'EXIT_REASON': exit_reason
+            })
+            
+    trade_log_df = pd.DataFrame(trades)
+    
+    if not trade_log_df.empty:
+        total_profit_loss = trade_log_df['PROFIT_LOSS_PCT'].sum()
+        num_trades = len(trade_log_df)
+        profitable_trades = (trade_log_df['PROFIT_LOSS_PCT'] > 0).sum()
+        win_rate = profitable_trades / num_trades if num_trades > 0 else 0
+        
+        print(f"\nSimulation Results:")
+        print(f"Total Trades: {num_trades}")
+        print(f"Total Portfolio Return (sum of individual trade returns): {total_profit_loss:.4f}")
+        print(f"Profitable Trades: {profitable_trades}")
+        print(f"Win Rate: {win_rate:.2%}")
+        print("\nFirst 10 Trades:")
+        print(trade_log_df.head(10))
+        print("\nLast 10 Trades:")
+        print(trade_log_df.tail(10))
+        
+        print("\nProfit/Loss by Exit Reason:")
+        print(trade_log_df.groupby('EXIT_REASON')['PROFIT_LOSS_PCT'].mean().sort_values(ascending=False))
+        
+        print("\nProfit/Loss by Signal Type:")
+        print(trade_log_df.groupby('SIGNAL')['PROFIT_LOSS_PCT'].mean().sort_values(ascending=False))
+
     else:
-        print("No 0.0% ATM Call options found for analysis with current thresholds.")
+        print("No trades generated based on current predictions and thresholds.")
+    
+    return trade_log_df
 
-    atm_puts = df[(df['IS_CALL'] == 0) & (df['MONEYNESS'] >= atm_lower) & (df['MONEYNESS'] <= atm_upper)]
-    print(f"\n--- 0.0% ATM PUTS ({atm_lower} <= Underlying / STRIKE <= {atm_upper}) ---")
-    if not atm_puts.empty:
-        print(f"Number of 0.0% ATM Puts: {len(atm_puts)}")
-        print(f"Percentage of price increases (TARGET=1): {atm_puts['TARGET'].mean():.2%}")
-    else:
-        print("No 0.0% ATM Put options found for analysis with current thresholds.")
-
-    itm_calls = df[(df['IS_CALL'] == 1) & (df['MONEYNESS'] > atm_upper)]
-    print(f"\n--- 1% ITM CALLS (Underlying / STRIKE > {atm_upper}) ---")
-    if not itm_calls.empty:
-        print(f"Number of 1% ITM Calls: {len(itm_calls)}")
-        print(f"Percentage of price increases (TARGET=1): {itm_calls['TARGET'].mean():.2%}")
-    else:
-        print("No 1% ITM Call options found for analysis with current thresholds.")
-
-    itm_puts = df[(df['IS_CALL'] == 0) & (df['MONEYNESS'] < atm_lower)]
-    print(f"\n--- 1% ITM PUTS (Underlying / STRIKE < {atm_lower}) ---")
-    if not itm_puts.empty:
-        print(f"Number of 1% ITM Puts: {len(itm_puts)}")
-        print(f"Percentage of price increases (TARGET=1): {itm_puts['TARGET'].mean():.2%}")
-    else:
-        print("No 1% ITM Put options found for analysis with current thresholds.")
-
-
-print("=== Simple Options Price Movement Predictor ===\n")
+print("=== Options Trading Strategy Backtester ===\n")
 
 df = load_and_clean_data('NFO_DATA.csv')
 if df is None:
     print("Failed to load data. Please check if 'NFO_DATA.csv' exists and is correctly formatted.")
+    exit()
 
 print("Creating features...")
 df = create_features(df)
 
-print("Creating target variable...")
-df = create_target(df)
+print("Creating target variable and trade triggers...")
+df = create_target_and_triggers(df, price_change_threshold=0.01)
 
 print("Training model...")
 model, X_test, y_test, y_pred = train_model(df)
 
-analyze_option_types(df)
+trade_log = simulate_trades(
+    df, model, X_test, y_test, 
+    holding_period_days=1,
+    stop_loss_pct=0.03,
+    take_profit_pct=0.05
+)
